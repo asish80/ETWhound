@@ -29,13 +29,41 @@ using System.Numerics;
 using Microsoft.SqlServer.Server;
 using System.Net.NetworkInformation;
 using System.Diagnostics.Eventing.Reader;
-
-
+using Mono.Cecil;
+using static System.Net.Mime.MediaTypeNames;
+using System.Xml;
+using System.Runtime.InteropServices.ComTypes;
+using System.Security.Policy;
 
 namespace ETWHound
 {
     public static class Program
     {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr GetModuleHandle(string lpModuleName);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Ansi, SetLastError = true)]
+        private static extern IntPtr GetProcAddress(IntPtr hModule, string lpProcName);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr LoadLibrary(string lpFileName);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool FreeLibrary(IntPtr hModule);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool EnumExportedFunctions(IntPtr moduleHandle, IntPtr callback);
+
+        private delegate bool EnumExportedFunctionsCallbackDelegate(IntPtr moduleName, IntPtr functionOrdinal, IntPtr functionAddress);
+
+        private static bool EnumExportedFunctionsCallback(IntPtr moduleName, IntPtr functionOrdinal, IntPtr functionAddress)
+        {
+            string functionName = Marshal.PtrToStringAnsi(functionOrdinal);
+            Console.WriteLine(functionName);
+            return true; // Continue enumeration
+        }
+
         static readonly object _object = new object();
         public static UInt32 totalusers = 0;
         public static Guid GlobalNodeId = Guid.NewGuid();
@@ -50,8 +78,116 @@ namespace ETWHound
         public static String ImageLoadProcessName = String.Empty;
         public static Boolean ImageLoadientry = false;
         public static UInt32 ImageLoadProcessId = 0;
+        public static Mutex mutex = new Mutex();
 
-       
+
+        public class DllFunctionsRetriever
+        {
+            [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+            private static extern IntPtr GetModuleHandle(string moduleName);
+
+            [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+            private static extern bool EnumExportedFunctions(IntPtr moduleHandle, IntPtr callback);
+
+            private delegate bool EnumExportedFunctionsCallbackDelegate(IntPtr moduleName, IntPtr functionOrdinal, IntPtr functionAddress);
+
+            private static bool EnumExportedFunctionsCallback(IntPtr moduleName, IntPtr functionOrdinal, IntPtr functionAddress)
+            {
+                string functionName = Marshal.PtrToStringAnsi(functionOrdinal);
+                Console.WriteLine(functionName);
+                return true; // Continue enumeration
+            }
+
+            public static bool IsDllFile(string filePath)
+            {
+                string fileExtension = Path.GetExtension(filePath);
+                return string.Equals(fileExtension, ".dll", StringComparison.OrdinalIgnoreCase);
+            }
+
+        }
+
+        public class DllTypeChecker
+        {
+            public static bool IsDotNetDll(string filePath)
+            {
+                try
+                {
+                    using (FileStream fs = new FileStream(filePath, FileMode.Open, FileAccess.Read))
+                    {
+                        using (BinaryReader reader = new BinaryReader(fs))
+                        {
+                            // Check for the magic number indicating a .NET assembly
+                            if (reader.ReadUInt32() == 0x424A5342)
+                            {
+                                // Check for the PE signature offset
+                                uint peOffset = reader.ReadUInt32();
+                                reader.BaseStream.Seek(peOffset, SeekOrigin.Begin);
+
+                                // Check for the PE signature
+                                if (reader.ReadUInt32() == 0x00004550)
+                                {
+                                    // Check for the CLR header
+                                    reader.BaseStream.Seek(20, SeekOrigin.Current);
+                                    ushort peOptionalHeaderSize = reader.ReadUInt16();
+                                    reader.BaseStream.Seek(peOptionalHeaderSize - 2, SeekOrigin.Current);
+
+                                    // Check for the metadata signature
+                                    if (reader.ReadUInt32() == 0x00004550)
+                                    {
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                catch (Exception)
+                {
+                    // Handle any exceptions that occur during file reading
+                }
+
+                return false;
+            }
+
+        }
+
+        public class TDllReaderFunc
+        {
+            public string Name { get; set; }
+
+            public string DLLname { get; set; }
+            public Guid NodeId { get; set; }
+
+            public UInt64 NodeCnt = 0;
+
+            public TDllReaderFunc(string Name, string DLLname)
+            {
+                this.Name = Name;
+                this.DLLname = DLLname;
+                this.NodeId = GlobalNodeId;
+                GlobalNodeId = Guid.NewGuid();
+                this.NodeCnt = this.NodeCnt + 1;
+            }
+
+            public Guid searchDllFunc(string iname)
+            {
+                if (this.Name == iname)
+                    return this.NodeId;
+                else
+                    return Guid.Empty;
+            }
+
+            public bool foundDllFunc(string cuser)
+            {
+
+                if (this.DLLname == cuser)
+                    return true;
+                else
+                    return false;
+            }
+
+        }
+
         public class Computer
         {
 
@@ -179,7 +315,11 @@ namespace ETWHound
 
             public string dt;
 
-            public CImage(UInt32 pid, UInt32 imgchecksum, String iname)
+            public string imagesize;
+            public string imagebase;
+
+
+            public CImage(UInt32 pid, UInt32 imgchecksum, String iname,String imagesize, String imagebase, UInt32 timedatestamp)
             {
                 this.processId = pid;
                 this.NodeId = GlobalNodeId;
@@ -187,7 +327,9 @@ namespace ETWHound
                 this.imagexload = iname;
                 this.ImageChecksum = imgchecksum;
                 this.NodeCnt = this.NodeCnt + 1;
-                this.dt = DateTime.Now.ToString(@"MM\/dd\/yyyy h\:mm tt");
+                this.dt = timedatestamp.ToString();  // DateTime.Now.ToString(@"MM\/dd\/yyyy h\:mm tt");
+                this.imagebase = imagebase;
+                this.imagesize = imagesize;
 
             }
             public Guid searchCIprocessId(UInt32 Id)
@@ -514,6 +656,10 @@ namespace ETWHound
                 this.AccessCount++;
             }
 
+            public void setAccessCount()
+            {
+                this.AccessCount = this.AccessCount + 1;
+            }
             public Guid getStartNodeId()
             {
                 return this.StartNodeId;
@@ -618,6 +764,10 @@ namespace ETWHound
             public Dictionary<string, UInt32> process_pid_map;
             public Dictionary<UInt32, UInt32> process_parent_map;
             public Dictionary<UInt32, string> inverse_process_pid_map;
+            public Dictionary<string, string> relation_dict;
+            public Dictionary<string, UInt32> relation_count;
+            public Dictionary<string, string> tdllfunc_dict;
+            public Dictionary<string, Guid> tdllfunc_dll_dict; // DLL to GUID Mapping
         }
 
         public class Neo4jData
@@ -644,6 +794,8 @@ namespace ETWHound
             public List<CPSuspend> xPsuspend { get; set; }
 
             public List<ConnectionInfo> conninfo { get; set; }
+
+            public List<TDllReaderFunc> tdllfunc { get; set; }
 
         }
 
@@ -813,8 +965,10 @@ namespace ETWHound
 
                 try
                 {
-                    var p1 = Process.GetProcessById((int)processid).Parent().Id;
-                    pprocessid = ((uint)p1);
+                    //var p1 = Process.GetProcessById((int)processid).Parent().Id;
+                    //pprocessid = ((uint)p1);
+                    Process p1 = ParentProcessUtilities.GetParentProcess((int)processid);
+                    pprocessid = (uint)p1.Id;
                     username = ProcessExtensions.GetProcessUser(p);
                 }
                 catch
@@ -979,7 +1133,8 @@ namespace ETWHound
                 WMIOps = new List<WMIOperation>(),
                 xImgLoad = new List<CImage>(),
                 xPsuspend = new List<CPSuspend>(),
-                conninfo = new List<ConnectionInfo>()
+                conninfo = new List<ConnectionInfo>(),
+                tdllfunc = new List<TDllReaderFunc>()
             };
 
             myprocess4j = new Process4j
@@ -987,8 +1142,11 @@ namespace ETWHound
                 process_dict = new Dictionary<string, Guid>(),
                 process_pid_map = new Dictionary<string,UInt32>(),
                 process_parent_map = new Dictionary<UInt32,UInt32>(),
-                inverse_process_pid_map = new Dictionary<UInt32,string>()
-
+                inverse_process_pid_map = new Dictionary<UInt32,string>(),
+                relation_dict  = new Dictionary<string,string>(),
+                relation_count = new Dictionary<string,UInt32>(),
+                tdllfunc_dict  =  new Dictionary<string,string>(),
+                tdllfunc_dll_dict = new Dictionary<string,Guid>()
             };
 
             var trace = new UserTrace("ETWHound");
@@ -1015,10 +1173,7 @@ namespace ETWHound
 
             foreach (NetworkInterface netInterface in NetworkInterface.GetAllNetworkInterfaces())
             {
-                //Console.WriteLine("Name: " + netInterface.Name);
-               // Console.WriteLine("Description: " + netInterface.Description);
-               // Console.WriteLine("Addresses: ");
-
+               
                 IPInterfaceProperties ipProps = netInterface.GetIPProperties();
 
                 foreach (UnicastIPAddressInformation addr in ipProps.UnicastAddresses)
@@ -1031,28 +1186,9 @@ namespace ETWHound
 
                 }
 
-               // Console.WriteLine("");
+             
             }
 
-            /*
-            string hostName = Dns.GetHostName();
-            IPHostEntry local = Dns.GetHostEntry(hostName);
-            string IPHost;
-
-            foreach (IPAddress ipaddress in local.AddressList)
-            {
-                IPHost = ipaddress.ToString();
-            }
-
-            if (isLocal("192.168.121.22"))
-            {
-                Console.WriteLine("Yes, it is a local system");
-            }
-            else
-            {
-                Console.WriteLine("No, it is not a local system");
-            }
-            */
             //
             // Parse the arguments
             //
@@ -1081,9 +1217,18 @@ namespace ETWHound
 
             HandlesUtility.EnumerateExistingHandles(NamedPipeSniffer.GetRunningChromeProcesses());
 
+            DateTime currentDateTime1 = DateTime.Now;
+            Console.WriteLine("Current date and time: " + currentDateTime1);
+
             AddUserList();
             IterateAndAddProcessList();
 
+          
+
+            DateTime currentDateTime = DateTime.Now;
+            Console.WriteLine("Current date and time: " + currentDateTime);
+
+         
             //
             // Start sniffing
             //
@@ -1232,7 +1377,7 @@ namespace ETWHound
                 }
 
 
-                var jsonData = JsonConvert.SerializeObject(mydata, Formatting.Indented);
+                var jsonData = JsonConvert.SerializeObject(mydata, Newtonsoft.Json.Formatting.Indented);
               //  Console.WriteLine(jsonData);
                 File.WriteAllText("C:\\NTT\\ETWHound.json", jsonData);
                 GenerateComputerNodesCypher();
@@ -1245,6 +1390,7 @@ namespace ETWHound
                 GenerateWMIOpscypher();
                 GenerateRelationShips();
                 GenerateImageLoadCypher();
+                GenerateDllImageFuncCypher();
               
 
             };
@@ -1315,7 +1461,7 @@ Available options:
             foreach (CImage cid in mydata.xImgLoad)
             {
                 string nodename = RemoveSpecialChars(cid.imagexload);
-                string s = $"CREATE (P{nodename}:ImageLoadName {{ NodeId: '{RemoveSpecialChars(cid.NodeId.ToString())}' , ImageName: '{cid.imagexload}', ProcessId: '{cid.processId}' , Imagechecksum: '{cid.ImageChecksum}' , NodeCnt:'{cid.NodeCnt}' }} ) ";
+                string s = $"CREATE (:ImageLoadName {{ NodeId: '{RemoveSpecialChars(cid.NodeId.ToString())}' , ImageName: '{cid.imagexload}', ProcessId: '{cid.processId}' , Imagechecksum: '{cid.ImageChecksum}' , NodeCnt:'{cid.NodeCnt}' , Imagesize:'{cid.imagesize}',  Imagebase:'{cid.imagebase}',  TimeStamp:'{cid.imagesize}' }} ) ";
                 output.AppendLine(s);
             }
 
@@ -1331,7 +1477,7 @@ Available options:
             foreach (CProcessId cid in mydata.xImageName)
             {
                 string nodename = RemoveSpecialChars(cid.imagexname);
-                string s = $"CREATE (P{nodename}:ImageName {{ NodeId: '{RemoveSpecialChars(cid.NodeId.ToString())}' , ImageName: '{cid.imagexname}', ProcessId: '{cid.processId}' , PProcessId: '{cid.parentProcessId}' , NodeCnt:'{cid.NodeCnt}' }} ) ";
+                string s = $"CREATE (:ImageName {{ NodeId: '{RemoveSpecialChars(cid.NodeId.ToString())}' , ImageName: '{cid.imagexname}', ProcessId: '{cid.processId}' , PProcessId: '{cid.parentProcessId}' , NodeCnt:'{cid.NodeCnt}' }} ) ";
                 output.AppendLine(s);
             }
 
@@ -1347,12 +1493,30 @@ Available options:
             foreach (NamedPipeSniffer.TrackNamedPipe tnp in mydata.CNamedPipes)
             {
                 string nodename = RemoveSpecialChars(tnp.Name);
-                string s = $"CREATE (N{nodename}:NamedPipe {{ NodeId: '{RemoveSpecialChars(tnp.NodeId.ToString())}' , PipeName: '{tnp.Name}' }} ) ";
+                string s = $"CREATE (:NamedPipe {{ NodeId: '{RemoveSpecialChars(tnp.NodeId.ToString())}' , PipeName: '{tnp.Name}' }} ) ";
                 output.AppendLine(s);
             }
 
             File.WriteAllText(filename, output.ToString());
 
+        }
+
+        static void GenerateDllImageFuncCypher()
+        {
+
+            string filename = @"dllfunc.cql";
+            var output = new StringBuilder();
+
+
+            foreach (TDllReaderFunc iip in mydata.tdllfunc)
+            {
+                string nodename = RemoveSpecialChars(iip.Name);
+                
+                string s = $"CREATE (:DllFunc {{ NodeId: '{RemoveSpecialChars(iip.NodeId.ToString())}' , DllFunc: '{nodename}' , DllName: '{iip.DLLname}' , NodeCnt:'{iip.NodeCnt}'}} ) ";
+                output.AppendLine(s);
+            }
+
+            File.WriteAllText(filename, output.ToString());
         }
         static void GenerateIPAddressCypher()
         {
@@ -1423,50 +1587,71 @@ Available options:
         {
             string filename = @"relationships.cql";
             var output = new StringBuilder();
+            string construct = string.Empty;
 
 
 
             foreach (Relationship irelationship in mydata.Relationships)
             {
                 UInt64 rel_id = globalrelationshipId;
+                UInt32 access_count = 0;
+
                if(irelationship.getRelationship() == "has")
                 {
                     rel_id = 0;
+                    access_count = irelationship.AccessCount;
                 }
                 if (irelationship.getRelationship() == "Created")
                 {
                     rel_id = 1;
+                    access_count = irelationship.AccessCount;
                 }
                 if (irelationship.getRelationship() == "ReadWrite")
                 {
                     rel_id = 2;
+                    access_count = irelationship.AccessCount;
                 }
                 if (irelationship.getRelationship() == "NamedOps")
                 {
                     rel_id = 3;
+                    access_count = irelationship.AccessCount;
                 }
                 if (irelationship.getRelationship()== "ImageLoad")
                 {
                     rel_id = 4;
+                    construct = irelationship.getStartNodeId().ToString() + ";" + irelationship.getEndNodeId().ToString();
+                    access_count = myprocess4j.relation_count[construct];
                 }
                 if (irelationship.getRelationship()== "Inbound")
                 {
                     rel_id = 5;
+                    access_count = irelationship.AccessCount;
                 }
                 if (irelationship.getRelationship()== "invokes")
                 {
                     rel_id = 6;
+                    access_count = irelationship.AccessCount;
                 }
                 if (irelationship.getRelationship() == "Accessed")
                 {
                     rel_id = 7;
+                    access_count = irelationship.AccessCount;
                 }
                 if (irelationship.getRelationship() == "Outbound")
                 {
                     rel_id = 8;
+                    access_count = irelationship.AccessCount;
                 }
+                if (irelationship.getRelationship() == "Export")
+                {
+                    rel_id = 9;
+                    construct = irelationship.getStartNodeId().ToString() + ";" + irelationship.getEndNodeId().ToString();
+                    access_count = myprocess4j.relation_count[construct];
+                }
+               
                 string nodename = RemoveSpecialChars(irelationship.getStartRelationshipName());
-                string s = $"MATCH (a:{nodename}), (b:{irelationship.getEndRelationShipName()}) WHERE a.NodeId = '{RemoveSpecialChars(irelationship.getStartNodeId().ToString())}' AND b.NodeId = '{RemoveSpecialChars(irelationship.getEndNodeId().ToString())}' CREATE(a) -[r{rel_id}:{irelationship.getRelationship()}]->(b) RETURN type(r{rel_id}); ";
+                //string s = $"MATCH (a:{nodename}), (b:{irelationship.getEndRelationShipName()}) WHERE a.NodeId = '{RemoveSpecialChars(irelationship.getStartNodeId().ToString())}' AND b.NodeId = '{RemoveSpecialChars(irelationship.getEndNodeId().ToString())}' CREATE(a) -[r{rel_id}:{irelationship.getRelationship()}]->(b) RETURN type(r{rel_id}); ";
+                string s = $"MATCH (a:{nodename}), (b:{irelationship.getEndRelationShipName()}) WHERE a.NodeId = '{RemoveSpecialChars(irelationship.getStartNodeId().ToString())}' AND b.NodeId = '{RemoveSpecialChars(irelationship.getEndNodeId().ToString())}' CREATE(a) -[r{rel_id}:{irelationship.getRelationship()} {{ AccessCount: {access_count} }}]->(b) RETURN type(r{rel_id}); ";
                 output.AppendLine(s);
                 s = "WITH 1 as dummy";
                 output.AppendLine(s);
@@ -1834,9 +2019,10 @@ Available options:
 
                     try
                     {
-                        pprocessid = (uint)Process.GetProcessById(int.Parse(connid)).Parent().Id;
-
-
+                        // pprocessid = (uint)Process.GetProcessById(int.Parse(connid)).Parent().Id;
+                            Process p1 = ParentProcessUtilities.GetParentProcess((int)processid);
+                            pprocessid = (uint)p1.Id;
+                        //pprocessid = 0;
                     }
                     catch
                     {
@@ -2168,8 +2354,11 @@ Available options:
             {
                 //var p = Process.GetProcessById((int)processid);
                 //data = p.ProcessName;
-                var p1 = Process.GetProcessById((int)processid).Parent().Id;
-                pprocessid = ((uint)p1);
+                // var p1 = Process.GetProcessById((int)processid).Parent().Id;
+                //   pprocessid = ((uint)p1);
+                //pprocessid = 0;
+				Process p1 = ParentProcessUtilities.GetParentProcess((int)processid);
+                pprocessid = (uint)p1.Id;
                 var p = Process.GetProcessById((int)pprocessid);
                 pdata = p.ProcessName;
             }
@@ -2284,6 +2473,7 @@ Available options:
             string data = string.Empty;
             string imagedata = string.Empty;
             string cdata = string.Empty;
+            string cdatafordll = string.Empty;
             string pdata = string.Empty;
             string pcdata = string.Empty;
             UInt32 praddlength;
@@ -2294,6 +2484,11 @@ Available options:
             Guid usernameid = Guid.Empty;
             Guid Event5processNodeId = Guid.Empty;
             UInt32 temp=0;
+                 UInt32 timedatestamp=0;
+            byte[] bytepeeraddlength = new byte[64];
+            String imagebase = String.Empty;
+            String imagesize = String.Empty;
+            UInt32 imageloadtimestamp = 0;
             //String username = String.Empty;
 
             if (record.Id == 1) // "A user right was adjusted."
@@ -2310,39 +2505,13 @@ Available options:
 
                 if (record.TryGetUInt32("ProcessID", out praddlength)) //Event ID 500
                 {
-                    //Console.WriteLine(peeraddlength);
                     
-                    //try
-                    //{
-                      //  var p = Process.GetProcessById((int)praddlength);
-                       // cdata = p.MainModule.FileName;
-
-                       
-                    //}
-                    //catch
-                    //{
-                      //  data = cdata;
-                    ///}
-
-           
-
                     
                 }
 
 
                 if (record.TryGetUInt32("ParentProcessID", out ppraddlength)) //Event ID 500
                 {
-                    //Console.WriteLine(peeraddlength);
-                    /*try
-                    {
-                        var p = Process.GetProcessById((int)ppraddlength);
-                        pcdata = p.MainModule.FileName;
-                    }
-                    catch
-                    {
-                        pdata = ppraddlength.ToString();
-                        pcdata = ppraddlength.ToString();
-                    }*/
                     try
                     {
                         pcdata = myprocess4j.inverse_process_pid_map[ppraddlength];
@@ -2353,8 +2522,7 @@ Available options:
                         pcdata = ppraddlength.ToString();
                     }
 
-                   // Console.WriteLine("parent process : " + pcdata);
-
+                   
                 }
 
                 // Add process name to PID mapping
@@ -2419,30 +2587,6 @@ Available options:
 
                 }
 
-                /*
-                foreach (CProcessId prid in mydata.xImageName)
-                {
-                    if (prid.foundCIprocessName(cdata))
-                    {
-                        foundiname = true;
-                        foundinameid = prid.NodeId;
-                        prid.NodeCnt++;
-                        break;
-                        //  foundinameid = prid.searchCIprocessName(data); 
-                    }
-                }
-                
-                foreach (CProcessId prid in mydata.xImageName)
-                {
-                    if (prid.foundCIprocessName(pcdata))
-                    {
-                        foundpiname = true;
-                        foundpinameid = prid.NodeId;
-                        //prid.NodeCnt++;
-                        break;
-                        //  foundinameid = prid.searchCIprocessName(data); 
-                    }
-                }*/
                 if (foundpiname == false)
                 {
                     //add parent process
@@ -2476,8 +2620,29 @@ Available options:
                             break;
                         }
                     }
-                    Relationship trelation1 = new Relationship(usernameid,foundpinameid, "Created", "User", "ImageName");
-                    mydata.Relationships.Add(trelation1);
+                    Program.mutex.WaitOne();
+
+                    bool RelationshipExists = false;
+
+                    foreach (Relationship crel in mydata.Relationships)
+                    {
+
+                        if (crel.StartNodeId == usernameid && crel.EndNodeId == foundpinameid)
+                        {
+                            crel.AccessCount++;
+                            RelationshipExists = true;
+                        }
+
+                    }
+
+                    if (!RelationshipExists)
+                    {
+
+                        Relationship trelation1 = new Relationship(usernameid, foundpinameid, "Created", "User", "ImageName");
+                        mydata.Relationships.Add(trelation1);
+                    }
+
+                    Program.mutex.ReleaseMutex();
                 }
 
                 if (foundiname == false)
@@ -2513,8 +2678,29 @@ Available options:
                             break;
                         }
                     }
-                    Relationship trelation1 = new Relationship(usernameid, foundinameid, "Created", "User", "ImageName");
-                    mydata.Relationships.Add(trelation1);
+
+                    bool RelationshipExists = false;
+
+
+                    Program.mutex.WaitOne();
+
+                    foreach (Relationship crel in mydata.Relationships)
+                    {
+
+                        if (crel.StartNodeId == usernameid && crel.EndNodeId == foundinameid)
+                        {
+                            crel.AccessCount++;
+                            RelationshipExists = true;
+                        }
+
+                    }
+
+                    if (!RelationshipExists)
+                    {
+                        Relationship trelation1 = new Relationship(usernameid, foundinameid, "Created", "User", "ImageName");
+                        mydata.Relationships.Add(trelation1);
+                    }
+                    Program.mutex.ReleaseMutex();
 
                     //Relationship trelation1 = new Relationship(foundpinameid, cimage.NodeId, "Parent", "ImageName", "ImageName");
                     // mydata.Relationships.Add(trelation1);
@@ -2533,6 +2719,7 @@ Available options:
                 {
                     
                     cdata = DevicePathMapper.FromDevicePath(imagedata);
+                    cdatafordll = cdata;
                     cdata = cdata.ToLower();
                     try
                     {
@@ -2547,17 +2734,17 @@ Available options:
 
                     }
 
-                    //   Console.WriteLine(cdata);
+                      //Console.WriteLine("cdata is :" + imagedata + "temp process id is :" + temp );
                 }
                 if (record.TryGetUInt32("ProcessID", out praddlength)) //Event ID 500
                 {
                     // Process p1 =  Process.GetProcessById((int)praddlength);
-                     //pdata = p1.MainModule.FileName;
-                     
+                    //pdata = p1.MainModule.FileName;
 
+                    //Console.WriteLine(praddlength.ToString());
                     try
                     {
-                        // Console.WriteLine("record 5 process id" + myprocess4j.inverse_process_pid_map[praddlength]);
+                       // Console.WriteLine("record 5 process name is" + myprocess4j.inverse_process_pid_map[praddlength]);
                         if (ImageLoadProcessId == praddlength && (temp != 0))
                         {
                             Event5processNodeId = myprocess4j.process_dict[cdata];
@@ -2566,7 +2753,8 @@ Available options:
                         else
                         {
                             ImageLoadientry = false;
-                            Event5processNodeId = myprocess4j.process_dict[ImageLoadProcessName];
+                            //Event5processNodeId = myprocess4j.process_dict[ImageLoadProcessName];
+                            Event5processNodeId = myprocess4j.process_dict[myprocess4j.inverse_process_pid_map[praddlength]];
 
                         }
                     }
@@ -2575,132 +2763,35 @@ Available options:
                         Event5processNodeId = Guid.Empty;
                         Console.WriteLine("process id is empty " + praddlength.ToString());
                     }
-
-                    //Console.WriteLine("record 5 process dict" + Event5processNodeId);
-
-                    //Console.WriteLine(Event5processNodeId);
-                    // Get parent process Id;
-                    /*
-                    bool icheck = false;
-                    try
-                    {
-                        // ppraddlength = (uint)Process.GetProcessById((int)praddlength).Parent().Id;
-
-                          valueExists = myprocess4j.process_pid_map[praddlength.ToString()];
-                          if(valueExists)
-                          {
-
-                          }
-
-                    }
-                    catch
-                    {
-                        ppraddlength = 0;
-                        foundprocessnameid = Guid.Empty;
-                        icheck = true;
-                    }
-                    Console.WriteLine(praddlength);
-                    Console.WriteLine(ppraddlength);
-                    */
-
-                    /*
-                    try
-                    {
-                        if (!icheck)
-                        {
-
-                            Process[] processCollection = Process.GetProcesses();
-                            foreach (Process p in processCollection)
-                            {
-
-                                //Console.WriteLine(p.ProcessName);
-                                //cdata = p.MainModule.FileName;
-                                if (ppraddlength == (uint)p.Id)
-                                {
-
-                                    username = ProcessExtensions.GetProcessUser(p);
-                                    foreach (CProcessId prid in mydata.xImageName)
-                                    {
-                                        if (prid.foundCIprocessName(p.MainModule.FileName))
-                                        {
-                                            //foundpiname = true;
-                                            foundprocessnameid = prid.NodeId;
-                                            prid.setpowner(username);
-                                            foreach (User cuser in mydata.Users)
-                                            {
-                                                if (cuser.cUser == username)
-                                                {
-                                                    usernameid = cuser.UserNodeId;
-
-                                                    break;
-                                                }
-                                            }
-                                            Console.WriteLine("added parent process");
-                                            Relationship trelation1 = new Relationship(usernameid, foundprocessnameid, "Created", "User", "ImageName");
-                                            mydata.Relationships.Add(trelation1);
-
-                                            break;
-
-                                            //prid.NodeCnt++;
-
-                                            //  foundinameid = prid.searchCIprocessName(data); 
-                                        }
-                                    }
-
-                                    //Console.WriteLine(username);
-                                    break;
-                                }
-
-                            }
-                        }
-                        */
-                    /*
-                    Process[] processCollection1 = Process.GetProcesses();
-                    foreach (Process p in processCollection1)
-                    {
-                        //cdata = p.MainModule.FileName;
-                        if (praddlength == (uint)p.Id)
-                        {
-                            username = ProcessExtensions.GetProcessUser(p);
-                            foreach (CProcessId prid in mydata.xImageName)
-                            {
-                                if (prid.foundCIprocessName(p.MainModule.FileName))
-                                {
-                                    prid.setpowner(username);
-                                    Event5processNodeId = prid.NodeId;
-                                    foreach (User cuser in mydata.Users)
-                                    {
-                                        if (cuser.cUser == username)
-                                        {
-                                            usernameid = cuser.UserNodeId;
-
-                                            break;
-                                        }
-                                    }
-                                    Console.WriteLine("added relationship process");
-                                    Relationship trelation2 = new Relationship(foundprocessnameid, prid.NodeId, "Parent", "ImageName", "ImageName");
-                                    mydata.Relationships.Add(trelation2);
-
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-                catch
-                {
-
-                }
-                    */
+                    
+                    //Console.WriteLine("Event5processNodeId is :" + Event5processNodeId);
+                  
                 }
                 if (record.TryGetUInt32("ImageCheckSum", out imagechecksum)) //Event ID 500
                 {
-                    //Console.WriteLine(peeraddlength);
-                    // var p = Process.GetProcessById((int)praddlength);
-                    //data = p.ProcessName;
+                   
 
                 }
-                
+                if (record.TryGetUInt32("TimeDateStamp", out imageloadtimestamp)) //Event ID 500
+                {
+                  
+
+                }
+                if (record.TryGetBinary("ImageBase", out bytepeeraddlength)) //Event ID 500
+
+                {
+                   
+                    imagebase = TotalPrintByteArray(bytepeeraddlength);
+                  
+
+                }
+                if (record.TryGetBinary("ImageSize", out bytepeeraddlength)) //Event ID 500
+                {
+                  
+                    imagesize= TotalPrintByteArray(bytepeeraddlength);                  
+
+                }
+
                 bool foundiname = false;
                 Guid foundinameid = Guid.Empty;
 
@@ -2713,6 +2804,12 @@ Available options:
                         foundiname = true;
                         foundinameid = prid.NodeId;
                         prid.NodeCnt++;
+                        prid.processId = praddlength;
+                        prid.ImageChecksum = imagechecksum;
+                        prid.imagesize = imagesize;
+                        prid.imagebase = imagebase;
+                        prid.dt = imageloadtimestamp.ToString();
+
                         break;
                         //  foundinameid = prid.searchCIprocessName(data); 
                     }
@@ -2721,18 +2818,233 @@ Available options:
                 if (foundiname == false)
                 {
                     //Event5processNodeId = myprocess4j.process_dict[cdata];
-                    CImage cimage = new CImage(praddlength, imagechecksum, cdata);
+                    CImage cimage = new CImage(praddlength, imagechecksum, cdata,imagesize,imagebase,imageloadtimestamp);
                     mydata.xImgLoad.Add(cimage);
                     foundinameid = cimage.NodeId;
 
                     //Console.WriteLine("added image load");
                 }
+                else
+                {
 
-                Relationship trelation1 = new Relationship(Event5processNodeId, foundinameid, "ImageLoad", "ImageName", "ImageLoadName");
-                mydata.Relationships.Add(trelation1);
+                }
+
+                //Console.WriteLine("imageload " + cdata + "foundinameid " + foundinameid);
+
+                bool RelationshipxExists = false;
+                /*
+                foreach (Relationship crel in mydata.Relationships)
+                {
+
+                    if(crel.StartNodeId == Event5processNodeId && crel.EndNodeId == foundinameid)
+                    {
+                        crel.AccessCount++;
+                        RelationshipxExists = true;
+                        break;
+                    }
+
+                }
+                */
+                /*
+                if (!RelationshipExists)
+                {
+                    Relationship trelation1 = new Relationship(Event5processNodeId, foundinameid, "ImageLoad", "ImageName", "ImageLoadName");
+                    mydata.Relationships.Add(trelation1);
+                }
+                */
+               
+
+                if (IsDllFile(cdata))
+               {
+                        bool founddllname = false;
+                        string tfilename = Path.GetFileName(cdata);
+                        string tfullpath = "C:\\Windows\\System32\\" +  tfilename;
+                        bool bExist = System.IO.File.Exists(tfullpath);
+                        Guid TdllreaderNodeId = Guid.Empty;
+
+                       //Console.WriteLine("cdata and bexist :" + tfullpath + " " + bExist);
+                       
+                    if (!bExist)
+                    {
+
+                        //string tdlltstring = Event5processNodeId.ToString() + ";" + foundinameid.ToString();
+                        //RelationshipxExists = myprocess4j.relation_dict.ContainsKey(rstring);
+
+                        foreach (TDllReaderFunc prid in mydata.tdllfunc)
+                        {
+                            if (prid.foundDllFunc(cdata))
+                            {
+                                founddllname = true;
+                                TdllreaderNodeId = prid.NodeId;
+                                break;
+                            }
+                        }
+
+                        if (!founddllname)
+                        {
+                            Process dllexporter = new Process();
+                            string arguments = "/from_files " + "\"" + cdatafordll + "\"" + " /scomma \"C:\\ntt\\dllex.csv\"";
+                            dllexporter.StartInfo.FileName = "D:\\DFS\\dllexp-x64\\dllexp.exe";
+                            dllexporter.StartInfo.Arguments = arguments;
+                            // Console.WriteLine("cdata and bexistz :" + arguments);
+                            dllexporter.Start();
+                            dllexporter.WaitForExit();
+
+                            //            DllReader.ReadFromFile(cdata, foundinameid);
+
+                            try
+                            {
+                                string[] lines = System.IO.File.ReadAllLines("C:\\ntt\\dllex.csv");
+                                foreach (string line in lines)
+                                {
+                                    string[] columns = line.Split(',');
+                                    foreach (string column in columns)
+                                    {
+                                        //Console.WriteLine($"{column}");
+                                        Program.mutex.WaitOne();
+                                        bool dllfuncexist = false;
+                                        Guid dllfuncnodeid = Guid.Empty;
+
+                                        foreach (TDllReaderFunc prid in mydata.tdllfunc)
+                                        {
+                                            if (prid.Name == column)
+                                            {
+                                                dllfuncexist = true;
+                                                dllfuncnodeid = prid.NodeId;
+                                                prid.NodeCnt++;
+                                                break;
+                                            }
+                                        }
+
+                                        if (dllfuncexist)
+                                        {
+
+                                        }
+                                        else
+                                        {
+                                            Program.TDllReaderFunc cDllReader = new Program.TDllReaderFunc(column, cdata);
+                                            Program.mydata.tdllfunc.Add(cDllReader);
+                                            dllfuncnodeid = cDllReader.NodeId;
+                                        }
+
+                                        string dlrstring = foundinameid.ToString() + ";" + dllfuncnodeid.ToString();
+
+                                        if (!myprocess4j.relation_dict.ContainsKey(dlrstring))
+                                        {
+                                            Program.Relationship trelationdd = new Program.Relationship(foundinameid, dllfuncnodeid, "Export", "ImageLoadName", "DllFunc");
+                                            Program.mydata.Relationships.Add(trelationdd);
+
+
+                                            myprocess4j.relation_dict.Add(dlrstring, "Export");
+                                            myprocess4j.relation_count.Add(dlrstring, 1);
+                                        }
+                                        else
+                                        {
+                                            myprocess4j.relation_count[dlrstring] = myprocess4j.relation_count[dlrstring] + 1;
+
+                                        }
+
+                                        Program.mutex.ReleaseMutex();
+                                        // string tdllstring = column + cdata;
+                                        // myprocess4j.tdllfunc_dict.Add(tdllstring, cDllReader.NodeId);
+
+
+                                        break;
+                                    }
+                                }
+                            }
+                            catch (Exception e)
+                            {
+                                Console.WriteLine("The File could not be read:");
+                                Console.WriteLine(e.Message);
+
+                                // Console.ReadLine();
+                            }
+
+                        }
+                        else
+                        {
+                            string dlrstring = foundinameid.ToString() + ";" + TdllreaderNodeId.ToString();
+
+                            myprocess4j.relation_count[dlrstring] = myprocess4j.relation_count[dlrstring] + 1;
+
+                            /*
+                            foreach (Relationship crel in mydata.Relationships)
+                            {
+
+                                if (crel.StartNodeId == foundinameid && crel.EndNodeId == TdllreaderNodeId)
+                                {
+                                    //crel.AccessCount++;
+                                    crel.setAccessCount();
+                                    break;
+                                }
+
+                            }
+                            */
+                        }
+                    }
+               }
+                /*
+
+                foreach (Relationship crel in mydata.Relationships)
+                {
+                    
+                    if (crel.getStartNodeId() == Event5processNodeId && crel.getEndNodeId() == foundinameid)
+                    {
+                       // crel.AccessCount++;
+                       
+                        RelationshipxExists = true;
+                        break;
+                    }
+                    break;
+
+                }
+                */
+                string rstring = Event5processNodeId.ToString() + ";"   + foundinameid.ToString();
+                RelationshipxExists = myprocess4j.relation_dict.ContainsKey(rstring);
+
+                
+                if (!RelationshipxExists)
+                {
+                    Program.mutex.WaitOne();
+                    Relationship trelation1 = new Relationship(Event5processNodeId, foundinameid, "ImageLoad", "ImageName", "ImageLoadName");
+                    mydata.Relationships.Add(trelation1);
+                    myprocess4j.relation_dict.Add(rstring, "ImageLoad");
+                    myprocess4j.relation_count.Add(rstring, 1);
+                    Program.mutex.ReleaseMutex();
+                }
+                else
+                {
+                        myprocess4j.relation_count[rstring] = myprocess4j.relation_count[rstring] + 1;
+
+                                       /*
+                    foreach (Relationship crel in mydata.Relationships)
+                    {
+
+                        if (crel.getStartNodeId() == Event5processNodeId && crel.getEndNodeId() == foundinameid)
+                        {
+                            crel.setAccessCount();
+
+                            //RelationshipxExists = true;
+                            break;
+                        }
+                       
+
+                    }*/
+                }
+
+
+                //}
+
 
             }
 
+        }
+
+        static bool IsDllFile(string filePath)
+        {
+            string fileExtension = Path.GetExtension(filePath);
+            return string.Equals(fileExtension, ".dll", StringComparison.OrdinalIgnoreCase);
         }
 
         static string PrintByteArray(byte[] bytes)
@@ -2755,6 +3067,25 @@ Available options:
             return(sb.ToString());
         }
 
+        static string TotalPrintByteArray(byte[] bytes)
+        {
+            var sb = new StringBuilder("");
+            int i = 0;
+            // Hack discard 1 st 4 bytes and last 8 bytes
+            foreach (var b in bytes)
+            {
+               // if (i > 0 && i < 8)
+              //  {
+                 //   if (i != 7)
+                 //       sb.Append(b + ".");
+                 //   else
+                        sb.Append(b);
+               // }
+                //i++;
+            }
+            //sb.Append("}");
+            return (sb.ToString());
+        }
         static void OnSMBEvent(IEventRecord record)
         {
 

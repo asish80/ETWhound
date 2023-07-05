@@ -38,11 +38,12 @@ namespace ETWHound
             var parentId = new PerformanceCounter("Process", "Creating Process ID", indexedProcessName);
             return Process.GetProcessById((int)parentId.NextValue());
         }
-
+        /*
         public static Process Parent(this Process process)
         {
             return FindPidFromIndexedProcessName(FindIndexedProcessName(process.Id));
         }
+        */
         public static string GetCommandLine(this Process process)
         {
             if (useWMI)

@@ -183,8 +183,8 @@ namespace ETWHound
                 Thread.Sleep((int)periodTimeSpan.TotalMilliseconds);
                 int packetsPerSecond = (int)((double)this.numPacketsProcessed / periodTimeSpan.TotalSeconds);
 
-                Console.SetCursorPosition(0, Console.CursorTop - 1);
-                Console.WriteLine("[+] Capturing " + packetsPerSecond + " packets/second...\n");
+               // Console.SetCursorPosition(0, Console.CursorTop - 1);
+             //   Console.WriteLine("[+] Capturing " + packetsPerSecond + " packets/second...\n");
 
                 this.numPacketsProcessed = 0;
             }
@@ -655,8 +655,8 @@ namespace ETWHound
 
                 Program.mydata.CNamedPipes.Add(cNamed);
 
-                Program.Relationship trelation1 = new Program.Relationship(Program.startingGlobalNodeId,cNamed.NodeId, "ReadWrite", "Computer", "NamedPipe");
-                Program.mydata.Relationships.Add(trelation1);
+                //Program.Relationship trelation1 = new Program.Relationship(Program.startingGlobalNodeId,cNamed.NodeId, "ReadWrite", "Computer", "NamedPipe");
+                //Program.mydata.Relationships.Add(trelation1);
 
                 try
                 {
@@ -726,6 +726,7 @@ namespace ETWHound
                 //  Console.WriteLine(foundpinameid);
                 // Console.WriteLine(destPID);
 
+                Program.mutex.WaitOne();
                 if (foundinameid != Guid.Empty)
                 {
                     Program.Relationship trelation2 = new Program.Relationship(foundinameid, cNamed.NodeId, "NamedOps", "ImageName", "NamedPipe");
@@ -739,6 +740,7 @@ namespace ETWHound
                     Program.Relationship trelation3 = new Program.Relationship(cNamed.NodeId, foundpinameid, "NamedOps", "NamedPipe", "ImageName");
                     Program.mydata.Relationships.Add(trelation3);
                 }
+                Program.mutex.ReleaseMutex();    // Release the Mutex.  
 
             }
 
